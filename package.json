@@ -1,0 +1,63 @@
+{
+  "name": "zielony-zakatek-loyalty",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aplikacja lojalnościowa sklepu ogrodniczego (karta stałego klienta, punkty, nagrody, panel administracyjny, integracja POS).",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint . --max-warnings=0",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "prisma migrate deploy",
+    "db:migrate:dev": "prisma migrate dev",
+    "db:seed": "tsx --conditions=react-server prisma/seed.ts",
+    "db:reset": "prisma migrate reset --force",
+    "admin:create": "tsx --conditions=react-server scripts/create-admin.ts",
+    "pos:simulate": "tsx --conditions=react-server scripts/pos-simulator.ts",
+    "jobs:run": "tsx --conditions=react-server scripts/run-jobs.ts",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "playwright test",
+    "postinstall": "prisma generate",
+    "pos:create": "tsx --conditions=react-server scripts/create-pos-integration.ts"
+  },
+  "prisma": {
+    "seed": "tsx --conditions=react-server prisma/seed.ts"
+  },
+  "dependencies": {
+    "@fontsource-variable/fraunces": "^5.3.0",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@node-rs/argon2": "^2.2.2",
+    "@prisma/client": "^6.19.3",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.56.0",
+    "next": "^15.5.27",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "server-only": "^0.0.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.2",
+    "@eslint/eslintrc": "^3.3.7",
+    "@playwright/test": "^1.56.1",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^22.20.5",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^15.5.27",
+    "prisma": "^6.19.3",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

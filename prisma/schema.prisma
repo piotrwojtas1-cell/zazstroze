@@ -1,0 +1,728 @@
+// Model danych aplikacji lojalnościowej „Zielony Zakątek”.
+// Zasady:
+//  - kwoty pieniężne: liczby całkowite w groszach (Int), nigdy float,
+//  - punkty: liczby całkowite; saldo karty jest pamięcią podręczną rejestru PointsLedger,
+//    aktualizowaną w tej samej transakcji bazodanowej co wpis w rejestrze,
+//  - PointsLedger, AuditLog i ConsentRecord są tylko do dopisywania (wymuszone triggerami w migracji).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────── Użytkownicy, role, uprawnienia ─────────────────────────
+
+enum UserKind {
+  CUSTOMER
+  STAFF
+}
+
+enum UserStatus {
+  ACTIVE
+  BLOCKED
+  DELETED // zanonimizowany
+}
+
+model User {
+  id                 String     @id @default(cuid())
+  email              String     @unique
+  passwordHash       String
+  kind               UserKind   @default(CUSTOMER)
+  status             UserStatus @default(ACTIVE)
+  failedLoginCount   Int        @default(0)
+  lockedUntil        DateTime?
+  lastLoginAt        DateTime?
+  passwordChangedAt  DateTime   @default(now())
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+  deletedAt          DateTime?
+
+  profile            Profile?
+  card               LoyaltyCard?
+  roles              UserRole[]
+  sessions           Session[]
+  resetTokens        PasswordResetToken[]
+  interests          UserInterest[]
+  consents           ConsentRecord[]
+  notifications      Notification[]
+  favorites          FavoriteProduct[]
+  shoppingList       ShoppingListItem[]
+  complaints         Complaint[]         @relation("ComplaintCustomer")
+  handledComplaints  Complaint[]         @relation("ComplaintHandler")
+  ledgerActions      PointsLedger[]      @relation("LedgerActor")
+  auditEntries       AuditLog[]
+  dataRequests       DataRequest[]
+  commPrefs          CommunicationPreference?
+
+  @@index([kind, createdAt])
+}
+
+model Profile {
+  userId     String   @id
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstName  String
+  lastName   String?
+  phone      String?
+  postalCode String?
+  birthMonth Int? // opcjonalnie, tylko miesiąc (minimalizacja danych) — do życzeń urodzinowych
+  updatedAt  DateTime @updatedAt
+}
+
+model Role {
+  id          String           @id @default(cuid())
+  key         String           @unique // ADMIN | MANAGER | STAFF
+  name        String
+  description String?
+  system      Boolean          @default(true)
+  permissions RolePermission[]
+  users       UserRole[]
+  createdAt   DateTime         @default(now())
+}
+
+model Permission {
+  key         String           @id // np. "rewards.manage"
+  description String
+  roles       RolePermission[]
+}
+
+model RolePermission {
+  roleId        String
+  permissionKey String
+  role          Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission    Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@id([roleId, permissionKey])
+}
+
+model UserRole {
+  userId    String
+  roleId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, roleId])
+}
+
+model Session {
+  id         String   @id // SHA-256 tokenu sesji (sam token tylko w ciasteczku)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  lastSeenAt DateTime @default(now())
+  ipHash     String?
+  userAgent  String?
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model RateLimitBucket {
+  key         String   @id
+  windowStart DateTime
+  count       Int
+}
+
+// ───────────────────────── Karta i program lojalnościowy ─────────────────────────
+
+enum CardStatus {
+  ACTIVE
+  BLOCKED
+  CLOSED
+}
+
+model LoyaltyCard {
+  id             String     @id @default(cuid())
+  number         String     @unique // 16 cyfr z sumą kontrolną Luhna
+  userId         String     @unique
+  user           User       @relation(fields: [userId], references: [id], onDelete: Restrict)
+  status         CardStatus @default(ACTIVE)
+  pointsBalance  Int        @default(0) // może być ujemne po zwrocie wydanych punktów
+  lifetimePoints Int        @default(0) // suma wszystkich naliczeń netto (bez wymian)
+  tierId         String?
+  tier           Tier?      @relation(fields: [tierId], references: [id])
+  tierUpdatedAt  DateTime?
+  issuedAt       DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  ledger       PointsLedger[]
+  transactions Transaction[]
+  coupons      Coupon[]
+  complaints   Complaint[]
+
+  @@index([tierId])
+}
+
+model Tier {
+  id               String        @id @default(cuid())
+  key              String        @unique
+  name             String
+  description      String
+  minPoints        Int // punkty naliczone w ciągu ostatnich `ProgramConfig.tierWindowDays` dni
+  multiplierBp     Int           @default(10000) // 10000 = x1.00
+  sortOrder        Int           @default(0)
+  benefits         String[]
+  color            String        @default("#4F7A43")
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  cards            LoyaltyCard[]
+  rewardsRequiring Reward[]
+}
+
+enum RoundingMode {
+  FLOOR
+  HALF_UP
+}
+
+// Wersjonowana konfiguracja programu. Aktywna jest najnowsza pozycja z active = true.
+// UWAGA: wartości domyślne są wyłącznie demonstracyjne i NIE stanowią zatwierdzonej polityki biznesowej.
+model ProgramConfig {
+  id                      String       @id @default(cuid())
+  version                 Int          @unique
+  active                  Boolean      @default(true)
+  earnRateBp              Int          @default(10000) // punkty za 1 zł × 10000 (10000 = 1 pkt / 1 zł)
+  rounding                RoundingMode @default(FLOOR)
+  minQualifyingGrosze     Int          @default(0) // minimalna kwalifikująca się wartość koszyka do naliczenia
+  excludedCategories      String[]     @default([]) // kategorie bez punktów (np. karty podarunkowe, kaucje)
+  tierWindowDays          Int          @default(365)
+  maxManualAdjustment     Int          @default(5000) // maks. |korekta| bez uprawnienia administratora
+  allowNegativeBalance    Boolean      @default(true) // zwrot po wydaniu punktów może dać saldo ujemne
+  couponDefaultValidDays  Int          @default(30)
+  pointValueGroszeInfo    Int          @default(5) // informacyjnie: orientacyjna wartość 1 pkt w groszach
+  createdById             String?
+  createdAt               DateTime     @default(now())
+  note                    String?
+}
+
+enum LedgerType {
+  EARN // naliczenie za zakup
+  BONUS // bonus kampanii / powitalny
+  REDEEM // wymiana na nagrodę
+  REDEEM_REVERSAL // zwrot punktów za anulowaną wymianę
+  RETURN_REVERSAL // korekta po zwrocie towaru
+  VOID_REVERSAL // korekta po anulowaniu transakcji
+  ADJUSTMENT // ręczna korekta pracownika
+  EXPIRATION // wygaśnięcie punktów (zarezerwowane)
+}
+
+// Niezmienny rejestr operacji punktowych.
+model PointsLedger {
+  id             String       @id @default(cuid())
+  cardId         String
+  card           LoyaltyCard  @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  type           LedgerType
+  points         Int // ze znakiem: + naliczenie, - obciążenie
+  balanceAfter   Int
+  reason         String
+  transactionId  String?
+  transaction    Transaction? @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+  couponId       String?
+  coupon         Coupon?      @relation(fields: [couponId], references: [id], onDelete: Restrict)
+  campaignId     String?
+  actorUserId    String?
+  actor          User?        @relation("LedgerActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  idempotencyKey String       @unique
+  metadata       Json?
+  createdAt      DateTime     @default(now())
+
+  @@index([cardId, createdAt])
+  @@index([type, createdAt])
+  @@index([transactionId])
+}
+
+// ───────────────────────── Transakcje i POS ─────────────────────────
+
+enum TransactionType {
+  SALE
+  RETURN
+}
+
+enum TransactionStatus {
+  COMPLETED
+  VOIDED
+}
+
+model Store {
+  id           String        @id @default(cuid())
+  code         String        @unique
+  name         String
+  street       String
+  city         String
+  postalCode   String
+  phone        String
+  email        String
+  openingHours Json // [{ "days": "pon.–pt.", "hours": "8:00–19:00" }]
+  latitude     Float?
+  longitude    Float?
+  transactions Transaction[]
+  createdAt    DateTime      @default(now())
+}
+
+model Transaction {
+  id                    String            @id @default(cuid())
+  integrationId         String
+  integration           PosIntegration    @relation(fields: [integrationId], references: [id], onDelete: Restrict)
+  externalId            String // identyfikator paragonu/transakcji w systemie POS
+  cardId                String
+  card                  LoyaltyCard       @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  storeId               String?
+  store                 Store?            @relation(fields: [storeId], references: [id])
+  type                  TransactionType
+  status                TransactionStatus @default(COMPLETED)
+  totalGrosze           Int // wartość zapłacona (po rabatach), dla zwrotu wartość zwrócona
+  qualifyingGrosze      Int // podstawa naliczenia punktów
+  discountGrosze        Int               @default(0)
+  pointsAwarded         Int               @default(0) // dla SALE: naliczone; dla RETURN: skorygowane (ujemne)
+  originalTransactionId String?
+  originalTransaction   Transaction?      @relation("ReturnOf", fields: [originalTransactionId], references: [id])
+  returns               Transaction[]     @relation("ReturnOf")
+  occurredAt            DateTime
+  voidedAt              DateTime?
+  voidReason            String?
+  calculation           Json? // szczegóły kalkulacji punktów (przejrzystość dla klienta i audytu)
+  createdAt             DateTime          @default(now())
+
+  items       TransactionItem[]
+  ledger      PointsLedger[]
+  redemptions CouponRedemption[]
+  complaints  Complaint[]
+
+  @@unique([integrationId, externalId])
+  @@index([cardId, occurredAt])
+  @@index([occurredAt])
+  @@index([type, status])
+}
+
+model TransactionItem {
+  id                String      @id @default(cuid())
+  transactionId     String
+  transaction       Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  sku               String
+  name              String
+  category          String
+  quantity          Int
+  unitPriceGrosze   Int
+  discountGrosze    Int         @default(0)
+  totalGrosze       Int // quantity * unitPrice - discount
+  qualifying        Boolean
+  returnedQuantity  Int         @default(0) // tylko dla pozycji sprzedaży
+
+  @@index([transactionId])
+  @@index([sku])
+}
+
+enum PosAdapterType {
+  DEMO // kanoniczny format JSON tej aplikacji (demonstracyjny)
+  INTERNAL // kasa demonstracyjna w panelu administracyjnym
+}
+
+model PosIntegration {
+  id              String         @id @default(cuid())
+  name            String
+  keyId           String         @unique // publiczny identyfikator klucza
+  secretEncrypted String // sekret HMAC zaszyfrowany AES-256-GCM kluczem z env
+  adapter         PosAdapterType @default(DEMO)
+  active          Boolean        @default(true)
+  lastUsedAt      DateTime?
+  createdAt       DateTime       @default(now())
+  transactions    Transaction[]
+  requests        PosRequestLog[]
+}
+
+// Dziennik żądań POS — idempotencja (zapamiętana odpowiedź) i monitoring błędów.
+model PosRequestLog {
+  id             String         @id @default(cuid())
+  integrationId  String
+  integration    PosIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  idempotencyKey String
+  endpoint       String
+  requestHash    String
+  status         Int
+  responseBody   Json?
+  errorCode      String?
+  durationMs     Int?
+  createdAt      DateTime       @default(now())
+
+  @@unique([integrationId, idempotencyKey])
+  @@index([createdAt])
+  @@index([status, createdAt])
+}
+
+// ───────────────────────── Nagrody, kupony, kampanie ─────────────────────────
+
+enum RewardType {
+  AMOUNT_OFF // rabat kwotowy (grosze)
+  PERCENT_OFF // rabat procentowy (bp: 1000 = 10%)
+  FREE_PRODUCT // produkt gratis (wartość do kwoty)
+}
+
+model Reward {
+  id                 String     @id @default(cuid())
+  name               String
+  description        String
+  type               RewardType
+  pointsCost         Int
+  valueGrosze        Int? // dla AMOUNT_OFF / FREE_PRODUCT
+  percentBp          Int? // dla PERCENT_OFF
+  minBasketGrosze    Int        @default(0)
+  maxDiscountGrosze  Int? // limit rabatu procentowego
+  excludedCategories String[]   @default([])
+  validDays          Int        @default(30) // ważność kuponu od wymiany
+  stock              Int? // null = bez limitu
+  perCustomerLimit   Int? // null = bez limitu
+  requiredTierId     String?
+  requiredTier       Tier?      @relation(fields: [requiredTierId], references: [id])
+  imageEmoji         String     @default("🎁")
+  active             Boolean    @default(true)
+  startsAt           DateTime?
+  endsAt             DateTime?
+  sortOrder          Int        @default(0)
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+  coupons            Coupon[]
+
+  @@index([active, sortOrder])
+}
+
+enum CouponStatus {
+  AVAILABLE // dostępny do użycia
+  ACTIVATED // aktywowany przez klienta — kasa zastosuje go automatycznie
+  USED // wykorzystany
+  EXPIRED // wygasły
+  CANCELLED // anulowany przez obsługę
+}
+
+enum CouponSource {
+  REWARD
+  CAMPAIGN
+  GOODWILL
+}
+
+model Coupon {
+  id                 String       @id @default(cuid())
+  code               String       @unique
+  cardId             String
+  card               LoyaltyCard  @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  source             CouponSource
+  rewardId           String?
+  reward             Reward?      @relation(fields: [rewardId], references: [id])
+  campaignId         String?
+  campaign           Campaign?    @relation(fields: [campaignId], references: [id])
+  title              String
+  description        String?
+  type               RewardType
+  valueGrosze        Int?
+  percentBp          Int?
+  minBasketGrosze    Int          @default(0)
+  maxDiscountGrosze  Int?
+  excludedCategories String[]     @default([])
+  status             CouponStatus @default(AVAILABLE)
+  pointsSpent        Int          @default(0)
+  validFrom          DateTime     @default(now())
+  expiresAt          DateTime
+  activatedAt        DateTime?
+  usedAt             DateTime?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  redemptions CouponRedemption[]
+  ledger      PointsLedger[]
+
+  @@index([cardId, status])
+  @@index([status, expiresAt])
+}
+
+model CouponRedemption {
+  id                    String       @id @default(cuid())
+  couponId              String
+  coupon                Coupon       @relation(fields: [couponId], references: [id], onDelete: Restrict)
+  integrationId         String
+  externalTransactionId String
+  transactionId         String?
+  transaction           Transaction? @relation(fields: [transactionId], references: [id])
+  discountGrosze        Int
+  basketGrosze          Int
+  redeemedAt            DateTime     @default(now())
+  releasedAt            DateTime?
+  releaseReason         String?
+
+  @@index([couponId])
+  @@index([integrationId, externalTransactionId])
+}
+
+enum CampaignType {
+  POINTS_MULTIPLIER // mnożnik punktów dla kategorii
+  BONUS_POINTS // stały bonus za zakup od kwoty
+  SEASONAL_OFFER // oferta/treść promocyjna w aplikacji (bez wpływu na punkty)
+}
+
+model Campaign {
+  id              String       @id @default(cuid())
+  name            String
+  description     String
+  type            CampaignType
+  multiplierBp    Int? // np. 20000 = x2
+  bonusPoints     Int?
+  minBasketGrosze Int          @default(0)
+  categories      String[]     @default([]) // puste = wszystkie kwalifikujące się
+  tierKeys        String[]     @default([]) // puste = wszystkie poziomy
+  interestKeys    String[]     @default([]) // personalizacja ofert
+  startsAt        DateTime
+  endsAt          DateTime
+  active          Boolean      @default(true)
+  showInApp       Boolean      @default(true)
+  imageEmoji      String       @default("🌱")
+  ctaLabel        String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  coupons         Coupon[]
+
+  @@index([active, startsAt, endsAt])
+}
+
+// ───────────────────────── Personalizacja, treści ─────────────────────────
+
+model Interest {
+  key   String         @id
+  name  String
+  emoji String
+  sort  Int            @default(0)
+  users UserInterest[]
+}
+
+model UserInterest {
+  userId      String
+  interestKey String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  interest    Interest @relation(fields: [interestKey], references: [key], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@id([userId, interestKey])
+}
+
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model Article {
+  id           String        @id @default(cuid())
+  slug         String        @unique
+  title        String
+  excerpt      String
+  body         String // prosty tekst z akapitami oddzielonymi pustą linią
+  category     String
+  interestKeys String[]      @default([])
+  months       Int[]         @default([]) // 1–12, puste = cały rok
+  readMinutes  Int           @default(3)
+  emoji        String        @default("🌿")
+  status       ContentStatus @default(DRAFT)
+  publishedAt  DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([status, publishedAt])
+}
+
+model GardenTask {
+  id          String   @id @default(cuid())
+  month       Int // 1–12
+  title       String
+  description String
+  interestKey String?
+  articleSlug String?
+  sort        Int      @default(0)
+
+  @@index([month])
+}
+
+model Product {
+  id          String             @id @default(cuid())
+  sku         String             @unique
+  name        String
+  category    String
+  priceGrosze Int
+  emoji       String             @default("🪴")
+  active      Boolean            @default(true)
+  favorites   FavoriteProduct[]
+  listItems   ShoppingListItem[]
+}
+
+model FavoriteProduct {
+  userId    String
+  productId String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, productId])
+}
+
+model ShoppingListItem {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId String?
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  text      String
+  quantity  Int      @default(1)
+  done      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, done])
+}
+
+// ───────────────────────── Zgody, komunikacja, powiadomienia ─────────────────────────
+
+enum ConsentType {
+  TERMS // akceptacja regulaminu (wymagana do udziału w programie)
+  PRIVACY_ACK // potwierdzenie zapoznania się z polityką prywatności
+  MARKETING_EMAIL
+  MARKETING_SMS
+  MARKETING_PUSH
+  PERSONALIZATION // profilowanie ofert na podstawie zakupów i zainteresowań
+}
+
+// Historia zgód — tylko dopisywanie. Bieżący stan = najnowszy wpis dla danego typu.
+model ConsentRecord {
+  id           String      @id @default(cuid())
+  userId       String
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type         ConsentType
+  granted      Boolean
+  documentVersion String
+  source       String // "registration" | "profile" | "admin"
+  ipHash       String?
+  createdAt    DateTime    @default(now())
+
+  @@index([userId, type, createdAt])
+}
+
+model CommunicationPreference {
+  userId             String   @id
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Komunikaty transakcyjne (np. naliczenie punktów, wygasanie kuponu) — kanał w aplikacji zawsze aktywny.
+  transactionalEmail Boolean  @default(true)
+  updatedAt          DateTime @updatedAt
+}
+
+enum NotificationCategory {
+  TRANSACTIONAL
+  MARKETING
+  SYSTEM
+}
+
+model Notification {
+  id        String               @id @default(cuid())
+  userId    String
+  user      User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category  NotificationCategory
+  title     String
+  body      String
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime             @default(now())
+
+  @@index([userId, readAt, createdAt])
+}
+
+// Kolejka wiadomości e-mail (adapter wysyłki odczytuje i wysyła; w trybie demo tylko zapis/log).
+model EmailOutbox {
+  id        String    @id @default(cuid())
+  to        String
+  subject   String
+  body      String
+  category  NotificationCategory
+  sentAt    DateTime?
+  error     String?
+  createdAt DateTime  @default(now())
+
+  @@index([sentAt, createdAt])
+}
+
+// ───────────────────────── Obsługa klienta, RODO, audyt ─────────────────────────
+
+enum ComplaintStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  REJECTED
+}
+
+model Complaint {
+  id            String          @id @default(cuid())
+  userId        String
+  user          User            @relation("ComplaintCustomer", fields: [userId], references: [id], onDelete: Cascade)
+  cardId        String?
+  card          LoyaltyCard?    @relation(fields: [cardId], references: [id])
+  transactionId String?
+  transaction   Transaction?    @relation(fields: [transactionId], references: [id])
+  subject       String
+  description   String
+  status        ComplaintStatus @default(OPEN)
+  resolution    String?
+  handledById   String?
+  handledBy     User?           @relation("ComplaintHandler", fields: [handledById], references: [id], onDelete: SetNull)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@index([status, createdAt])
+}
+
+enum DataRequestType {
+  EXPORT
+  DELETION
+}
+
+enum DataRequestStatus {
+  COMPLETED
+  REJECTED
+}
+
+model DataRequest {
+  id          String            @id @default(cuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        DataRequestType
+  status      DataRequestStatus
+  note        String?
+  createdAt   DateTime          @default(now())
+}
+
+// Niezmienny dziennik audytowy operacji administracyjnych i zmian salda.
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String?
+  actor       User?    @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorLabel  String // np. e-mail pracownika lub "pos:KASA-01" — zachowane po usunięciu konta
+  action      String // np. "points.adjust", "reward.update"
+  entityType  String
+  entityId    String?
+  reason      String?
+  before      Json?
+  after       Json?
+  ipHash      String?
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+  @@index([createdAt])
+}

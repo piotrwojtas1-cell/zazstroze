@@ -1,0 +1,112 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/fraunces";
+
+/*
+ * System wizualny „Zielony Zakątek”: zieleń lasu, mech, glina i kremowe tła.
+ * Kontrast tekstu na tłach spełnia WCAG 2.1 AA (≥ 4.5:1 dla tekstu podstawowego).
+ */
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Fraunces Variable", ui-serif, Georgia, serif;
+
+  --color-forest-50: #f1f6f2;
+  --color-forest-100: #dcebe0;
+  --color-forest-200: #b9d6c1;
+  --color-forest-300: #8dbb9b;
+  --color-forest-400: #5e9a72;
+  --color-forest-500: #3f7d55;
+  --color-forest-600: #2f6443;
+  --color-forest-700: #264f37;
+  --color-forest-800: #1f3f2e;
+  --color-forest-900: #1b3b2f;
+  --color-forest-950: #0f2219;
+
+  --color-moss-100: #eef2df;
+  --color-moss-300: #c9d59a;
+  --color-moss-500: #8aa04b;
+  --color-moss-700: #5a6b2c;
+
+  --color-clay-50: #fbf4ee;
+  --color-clay-100: #f5e6d8;
+  --color-clay-300: #e2b48c;
+  --color-clay-500: #b9733f;
+  --color-clay-700: #8a4f26;
+
+  --color-cream: #f8f6f0;
+  --color-sand: #efe9dc;
+  --color-ink: #17251d;
+  --color-muted: #55635a;
+
+  --color-danger-50: #fdf1f0;
+  --color-danger-600: #b42318;
+  --color-danger-700: #912018;
+  --color-warning-50: #fef7e6;
+  --color-warning-700: #8a5a00;
+
+  --shadow-card: 0 1px 2px rgb(23 37 29 / 0.04), 0 4px 16px rgb(23 37 29 / 0.06);
+  --shadow-lift: 0 8px 30px rgb(23 37 29 / 0.12);
+
+  --animate-fade-in: fade-in 0.25s ease-out both;
+  --animate-pop: pop 0.3s cubic-bezier(0.2, 0.9, 0.3, 1.3) both;
+
+  @keyframes fade-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes pop {
+    from { opacity: 0; transform: scale(0.94); }
+    to { opacity: 1; transform: none; }
+  }
+}
+
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+    color-scheme: light;
+  }
+  body {
+    @apply bg-cream text-ink font-sans antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  h1, h2, h3 {
+    @apply font-display tracking-tight text-forest-900;
+    font-variation-settings: "SOFT" 50, "opsz" 72;
+  }
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-forest-600;
+  }
+  ::selection {
+    @apply bg-forest-200;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl bg-white shadow-card ring-1 ring-forest-900/5;
+  }
+  .label {
+    @apply block text-sm font-medium text-ink;
+  }
+  .input {
+    @apply block w-full rounded-xl border border-forest-900/15 bg-white px-3.5 py-2.5 text-base text-ink placeholder:text-muted/70
+      transition focus:border-forest-600 focus:outline-none focus:ring-4 focus:ring-forest-600/15 disabled:bg-sand/60;
+  }
+  .input[aria-invalid="true"] {
+    @apply border-danger-600 focus:ring-danger-600/15;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium;
+  }
+  .leaf-pattern {
+    background-image: radial-gradient(circle at 88% 8%, rgb(141 187 155 / 0.28), transparent 42%),
+      radial-gradient(circle at 6% 96%, rgb(201 213 154 / 0.16), transparent 46%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

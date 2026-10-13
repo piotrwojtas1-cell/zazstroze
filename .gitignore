@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+next-env.d.ts
+.env
+.env.local
+.env.*.local
+.env.test
+backups/
+*.log
+.DS_Store
+.pos-*-credentials.json
